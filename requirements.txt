@@ -3,3 +3,6 @@ ultralytics
 opencv-python-headless
 numpy
 pillow
+fastapi
+uvicorn
+scipy
