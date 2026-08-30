@@ -10,9 +10,9 @@ import cv2
 import numpy as np
 
 try:
-    from .occupancy_grid import CAMERA, project_world_to_image
+    from .occupancy_grid import CAMERA, project_world_to_image, road_half_width_at_z
 except ImportError:
-    from occupancy_grid import CAMERA, project_world_to_image
+    from occupancy_grid import CAMERA, project_world_to_image, road_half_width_at_z
 
 IMG_W = CAMERA["image_w"]
 IMG_H = CAMERA["image_h"]
@@ -45,6 +45,7 @@ class SceneSimulator:
         self.animal_timer = 2.5
         self.objects: List[Dict] = []
         self._obj_id = 0
+        self.unstructured = False
         self._background = self._render_background()
         self.reset()
 
@@ -131,6 +132,23 @@ class SceneSimulator:
             x += bw + rng.randint(2, 14)
         return bg
 
+    def _road_half_width(self, z: float) -> float:
+        return road_half_width_at_z(z, unstructured=self.unstructured)
+
+    def _variable_road_poly(self, frame, margin: float, z_near: float, z_far: float,
+                             color, samples: int = 24) -> None:
+        """Fills the drivable area as a polygon that follows the (possibly
+        narrowing) road-half-width profile, instead of a single fixed-width
+        quad. margin extends both edges outward by a fixed amount (e.g. for
+        a dirt shoulder strip beyond the nominal road)."""
+        zs = np.linspace(z_near, z_far, samples)
+        left_pts = [project_world_to_image(-self._road_half_width(z) - margin, z) for z in zs]
+        right_pts = [project_world_to_image(self._road_half_width(z) + margin, z) for z in zs]
+        poly_pts = left_pts + right_pts[::-1]
+        poly = np.array([[int(round(x)), min(int(round(y)), IMG_H)] for x, y in poly_pts],
+                        dtype=np.int32)
+        cv2.fillPoly(frame, [poly], color)
+
     def _road_poly(self, frame, u_left: float, u_right: float, z_near: float,
                    z_far: float, color) -> None:
         pts = [project_world_to_image(u_left, z_near),
@@ -143,15 +161,24 @@ class SceneSimulator:
 
     def _draw_scene(self) -> np.ndarray:
         frame = self._background.copy()
-        self._road_poly(frame, -ROAD_HALF - 0.35, ROAD_HALF + 0.35, 2.0, 90.0, COL_ROAD)
 
-        for z0 in np.arange(-self.phase, 58.0, 8.0):
-            z1 = min(z0 + 3.0, 58.0)
-            if z1 <= 2.0:
-                continue
-            self._road_poly(frame, -0.09, 0.09, max(z0, 2.0), z1, COL_LANE)
-        self._road_poly(frame, ROAD_HALF + 0.15, ROAD_HALF + 0.27, 2.0, 70.0, COL_EDGE)
-        self._road_poly(frame, -ROAD_HALF - 0.27, -ROAD_HALF - 0.15, 2.0, 70.0, COL_EDGE)
+        if self.unstructured:
+            # Variable-width, unmarked road: no painted centerline or edge
+            # lines, matching how the planner's occupancy grid treats it —
+            # the boundary is a soft, unmarked shoulder, not a hard-walled
+            # structured corridor.
+            self._variable_road_poly(frame, 1.0, 2.0, 90.0,
+                                     tuple(int(c * 0.85) for c in COL_ROAD))
+            self._variable_road_poly(frame, 0.35, 2.0, 90.0, COL_ROAD)
+        else:
+            self._road_poly(frame, -ROAD_HALF - 0.35, ROAD_HALF + 0.35, 2.0, 90.0, COL_ROAD)
+            for z0 in np.arange(-self.phase, 58.0, 8.0):
+                z1 = min(z0 + 3.0, 58.0)
+                if z1 <= 2.0:
+                    continue
+                self._road_poly(frame, -0.09, 0.09, max(z0, 2.0), z1, COL_LANE)
+            self._road_poly(frame, ROAD_HALF + 0.15, ROAD_HALF + 0.27, 2.0, 70.0, COL_EDGE)
+            self._road_poly(frame, -ROAD_HALF - 0.27, -ROAD_HALF - 0.15, 2.0, 70.0, COL_EDGE)
 
         for obj in sorted(self.objects, key=lambda o: -o["z"]):
             self._draw_object(frame, obj)
