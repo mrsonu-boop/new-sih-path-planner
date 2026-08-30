@@ -31,7 +31,9 @@ from backend.occupancy_grid import (
     ROAD_HALF_WIDTH_M,
     Z_MAX,
     build_grid,
+    constant_road_profile,
     project_image_to_world,
+    variable_road_profile,
 )
 from backend.path_planner import plan_path, pure_pursuit_steer
 from backend.perception import IMG_H, IMG_W, PerceptionEngine, SceneSimulator
@@ -153,6 +155,7 @@ def resolve_source(source: str, upload) -> str:
 
 def grab_frame(active: str, yolo_on: bool):
     ss = st.session_state
+    ss.sim.unstructured = bool(ss.get("unstructured_mode"))
     if active == "Simulation":
         return (*ss.sim.step(TICK_S, ss.speed_kmh / 3.6), "simulation", "simulated-gt")
 
@@ -213,7 +216,8 @@ def step_world(active: str, yolo_on: bool) -> None:
     ss = st.session_state
     frame, dets, source, detector = grab_frame(active, yolo_on)
 
-    grid = build_grid(dets)
+    profile = variable_road_profile if ss.get("unstructured_mode") else constant_road_profile
+    grid = build_grid(dets, road_profile=profile)
     t0 = time.perf_counter()
     plan = plan_path(grid, ego_u=ss.ego_u, target_u=0.0)
     latency_ms = (time.perf_counter() - t0) * 1000.0
@@ -386,6 +390,13 @@ with st.sidebar:
              "model is unavailable.")
 
     st.session_state.target_kmh = st.slider("Target speed (km/h)", 15, 90, 45, 5)
+
+    st.session_state.unstructured_mode = st.toggle(
+        "Unstructured road mode", value=False,
+        help="Replaces the fixed-width marked corridor with a variable-width, "
+             "unmarked road that narrows to a single-vehicle pinch point, with "
+             "soft (crossable) shoulders instead of hard walls — closer to a "
+             "real unmarked village road than a structured lane.")
 
     with st.container(horizontal=True):
         if st.button("Pause" if not st.session_state.paused else "Resume",
