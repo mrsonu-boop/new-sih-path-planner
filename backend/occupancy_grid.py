@@ -90,19 +90,71 @@ class OccupancyGrid:
         return self.hard.shape
 
 
-def build_grid(detections) -> OccupancyGrid:
+EDGE_SOFT_MARGIN_M = 1.2   # width of the soft shoulder ramp outside the nominal road edge
+EDGE_SOFT_COST = 0.85      # max soft cost at the edge of the shoulder ramp (below hard block)
+
+
+def road_half_width_at_z(z: float, unstructured: bool = False,
+                          pinch_z_center: float = 24.0, pinch_z_span: float = 12.0,
+                          pinch_half_width_m: float = 1.6,
+                          base_half_width_m: float = ROAD_HALF_WIDTH_M) -> float:
+    """Single source of truth for road half-width at forward distance z (meters).
+
+    Used by both the planner's occupancy grid and the perception renderer so the
+    bird's-eye planner and the camera-feed drawing always agree on where the
+    road actually narrows, instead of drifting out of sync.
+    """
+    if not unstructured:
+        return base_half_width_m
+    half_span = max(pinch_z_span / 2.0, 1e-6)
+    dist_from_center = abs(z - pinch_z_center)
+    if dist_from_center >= half_span:
+        return base_half_width_m
+    taper = 1.0 - dist_from_center / half_span  # 0 at edges of pinch window, 1 at center
+    return base_half_width_m - taper * (base_half_width_m - pinch_half_width_m)
+
+
+def constant_road_profile(_row: int) -> float:
+    """Default road profile: fixed half-width, matching a structured/marked road."""
+    return ROAD_HALF_WIDTH_M
+
+
+def variable_road_profile(row: int) -> float:
+    """Village-road style profile: narrows to a single-vehicle-width pinch point
+    ahead of the vehicle, then widens back out. Models an unmarked, irregular
+    -width unstructured road. Delegates to road_half_width_at_z so the camera
+    view (perception.py) can render the exact same profile."""
+    _, z = cell_to_world(row, GRID_W // 2)
+    return road_half_width_at_z(z, unstructured=True)
+
+
+def build_grid(detections, road_profile=None) -> OccupancyGrid:
     """Convert detections [{label, conf, box:[x1,y1,x2,y2]}] into an inflated BEV grid.
 
     Potholes become soft costs (avoided but traversable if the lane is blocked);
     animals/vehicles/persons and off-road cells are hard obstacles.
-    """
-    hard = np.zeros((GRID_H, GRID_W), dtype=bool)
-    soft = np.zeros((GRID_H, GRID_W), dtype=np.float32)
 
-    c_lo = int(round(GRID_W / 2 - ROAD_HALF_WIDTH_M / CELL_RES))
-    c_hi = int(round(GRID_W / 2 + ROAD_HALF_WIDTH_M / CELL_RES))
-    hard[:, :max(c_lo, 0)] = True
-    hard[:, min(c_hi, GRID_W):] = True
+    road_profile(row) -> half_width_m lets the road boundary vary per row instead
+    of using a single fixed ROAD_HALF_WIDTH_M, and the boundary itself is a soft
+    cost ramp (EDGE_SOFT_MARGIN_M wide) rather than an instant hard wall, so the
+    planner *can* cross onto the shoulder under pressure (e.g. avoiding an
+    obstacle) instead of treating every unmarked edge as impassable. This models
+    unstructured, unmarked, variable-width roads instead of a fixed lane corridor.
+    """
+    profile = road_profile or constant_road_profile
+    half_w = np.array([profile(row) for row in range(GRID_H)], dtype=np.float32)  # (GRID_H,)
+    c_lo = (GRID_W / 2 - half_w / CELL_RES)[:, None]   # (GRID_H, 1)
+    c_hi = (GRID_W / 2 + half_w / CELL_RES)[:, None]
+    cols = np.arange(GRID_W, dtype=np.float32)[None, :]  # (1, GRID_W)
+
+    dist_out = np.where(cols < c_lo, c_lo - cols, np.where(cols > c_hi, cols - c_hi, 0.0))
+    dist_out_m = dist_out * CELL_RES
+    margin_cells = max(EDGE_SOFT_MARGIN_M / CELL_RES, 1e-6)
+
+    hard = dist_out_m > EDGE_SOFT_MARGIN_M
+    ramp = np.clip(dist_out / margin_cells, 0.0, 1.0)
+    soft = np.where(hard, 0.0, EDGE_SOFT_COST * ramp ** 1.5).astype(np.float32)
+
     hard[:2, :] = True
     hard[-4:, :] = True
     hard[:, :2] = True
