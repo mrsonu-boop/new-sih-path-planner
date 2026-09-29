@@ -1,6 +1,7 @@
 streamlit
 ultralytics
 opencv-python-headless
+streamlit-webrtc==0.78.1
 numpy
 pillow
 fastapi

@@ -9,6 +9,7 @@ from __future__ import annotations
 import math
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -17,6 +18,7 @@ import cv2
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit_webrtc as webrtc
 
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
@@ -54,6 +56,59 @@ def hex_bgr(hexcol: str) -> tuple:
     return tuple(int(c) for c in bytes.fromhex(hexcol.lstrip("#")))[::-1]
 
 
+class WebcamFeed:
+    """Latest-frame holder for the WebRTC webcam stream.
+
+    ``streamlit-webrtc`` invokes ``video_frame_callback`` on the aiortc
+    worker thread, not the Streamlit script thread, so every frame crosses a
+    thread boundary. Session state is not safe to touch from that thread,
+    hence this plain lock-guarded holder.
+    """
+
+    STALE_S = 1.5
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._frame: np.ndarray | None = None
+        self._ts = 0.0
+        self._fps = 0.0
+
+    def put(self, frame) -> None:
+        """Store the newest frame. Called on the aiortc worker thread."""
+        rgb = frame.to_ndarray(format="rgb24")
+        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        with self._lock:
+            now = time.time()
+            if self._ts:
+                dt = now - self._ts
+                if 0.0 < dt < 1.0:
+                    inst = 1.0 / dt
+                    self._fps = inst if self._fps == 0.0 else 0.7 * self._fps + 0.3 * inst
+            self._frame = bgr
+            self._ts = now
+
+    def latest(self, max_age: float = STALE_S) -> np.ndarray | None:
+        """Most recent BGR frame, or None if the stream is idle or has stalled."""
+        with self._lock:
+            if self._frame is None or (time.time() - self._ts) > max_age:
+                return None
+            return self._frame
+
+    def reset(self) -> None:
+        with self._lock:
+            self._frame = None
+            self._ts = 0.0
+            self._fps = 0.0
+
+    @property
+    def live(self) -> bool:
+        return self.latest() is not None
+
+    @property
+    def fps(self) -> float:
+        return self._fps
+
+
 st.set_page_config(
     page_title="SIH26037 · Adaptive Path Planner",
     page_icon=":material/route:",
@@ -85,6 +140,9 @@ def init_state() -> None:
         "fps": 25.0,
         "source_key": None,
         "cap": None,
+        "webcam": None,
+        "webcam_on": True,
+        "webcam_playing": False,
         "hist_speed": [],
         "hist_steer": [],
         "hist_lat": [],
@@ -117,25 +175,29 @@ def reset_world() -> None:
 def resolve_source(source: str, upload) -> str:
     ss = st.session_state
     file_id = getattr(upload, "id", None) if source == "Video file" else None
-    key = (source, file_id)
+    key = (source, file_id, bool(ss.get("webcam_on")))
     if ss.source_key == key:
         return source if (source != "Video file" or upload) else "Simulation"
 
     if ss.cap is not None:
         ss.cap.release()
         ss.cap = None
+    if ss.get("webcam") is not None:
+        try:
+            ss.webcam.reset()
+        except Exception:
+            pass
     reset_world()
 
     if source == "Webcam":
-        cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-        if cap.isOpened():
-            ss.cap = cap
-            ss.fps = 30.0
-            ss.source_key = key
-            return "Webcam"
-        st.sidebar.caption(":red[No webcam available — falling back to simulation.]")
-        ss.source_key = ("Simulation", None)
-        return "Simulation"
+        if not ss.get("webcam_on", True):
+            st.sidebar.caption(":red[Webcam access disabled — falling back to simulation.]")
+            ss.source_key = ("Simulation", None, False)
+            return "Simulation"
+        if ss.get("webcam") is None:
+            ss.webcam = WebcamFeed()
+        ss.source_key = key
+        return "Webcam"
 
     if source == "Video file" and upload is not None:
         path = Path(tempfile.gettempdir()) / f"sih26037_{file_id}_{upload.name}"
@@ -149,7 +211,7 @@ def resolve_source(source: str, upload) -> str:
             return "Video file"
         st.sidebar.caption(":red[Could not decode that video — falling back to simulation.]")
 
-    ss.source_key = ("Simulation", None)
+    ss.source_key = ("Simulation", None, bool(ss.get("webcam_on")))
     return "Simulation"
 
 
@@ -160,7 +222,13 @@ def grab_frame(active: str, yolo_on: bool):
         return (*ss.sim.step(TICK_S, ss.speed_kmh / 3.6), "simulation", "simulated-gt")
 
     frame = None
-    if ss.cap is not None:
+    if active == "Webcam":
+        feed = ss.get("webcam")
+        if feed is not None:
+            frame = feed.latest()
+            if frame is not None:
+                ss.fps = feed.fps or 30.0
+    elif ss.cap is not None:
         ss.video_acc += TICK_S * ss.fps
         while ss.video_acc >= 1.0:
             ss.video_acc -= 1.0
@@ -170,6 +238,8 @@ def grab_frame(active: str, yolo_on: bool):
                 ok, f = ss.cap.read()
             if ok:
                 frame = f
+    if frame is None and active == "Webcam":
+        return (*ss.sim.step(TICK_S, ss.speed_kmh / 3.6), "simulation", "simulated-gt")
     if frame is None:
         blank = np.zeros((IMG_H, IMG_W, 3), np.uint8)
         cv2.putText(blank, "NO SIGNAL", (205, 190), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (90, 90, 90), 2)
@@ -383,6 +453,40 @@ with st.sidebar:
     upload = None
     if source == "Video file":
         upload = st.file_uploader("Upload a road clip", type=["mp4", "avi", "mov", "mkv"])
+    if source == "Webcam":
+        ss = st.session_state
+        ss.webcam_on = st.toggle(
+            "Use browser webcam", value=bool(ss.get("webcam_on", True)),
+            help="Streams through WebRTC, so it works on Streamlit Cloud where "
+                 "no local camera hardware exists. Turn off to use the simulated "
+                 "road instead.")
+        if ss.get("webcam") is None:
+            ss.webcam = WebcamFeed()
+        if ss.webcam_on:
+            try:
+                ctx = webrtc.webrtc_streamer(
+                    key="webcam_rtc",
+                    mode=webrtc.WebRtcMode.SENDONLY,
+                    media_stream_constraints={"video": True, "audio": False},
+                    video_frame_callback=ss.webcam.put,
+                    sendback_video=False,
+                    sendback_audio=False,
+                )
+                ss.webcam_playing = bool(getattr(ctx.state, "playing", False))
+            except Exception as exc:
+                st.caption(f":red[WebRTC unavailable ({type(exc).__name__}) — "
+                           f"running the simulated road.]")
+                ctx = None
+            if ctx is not None:
+                if ss.webcam.live:
+                    st.caption(f":green[Webcam live · {ss.webcam.fps:.0f} fps to planner]")
+                elif ss.webcam_playing:
+                    st.caption(":orange[Stream connected, waiting for frames…]")
+                else:
+                    st.caption(":orange[Press START and allow camera access. Until "
+                               "frames arrive the planner runs the simulated road.]")
+        else:
+            st.caption(":orange[Webcam off — running the simulated road.]")
     yolo_on = st.toggle(
         "YOLOv8 detection", value=True, disabled=(source == "Simulation"),
         help="Simulation uses ground-truth boxes. Webcam and uploaded video run "
